@@ -1,44 +1,47 @@
 name: Run Notebook
 
 on:
-  push:
-    branches: ["**"]
-    paths:
-      - "image_classifier.ipynb"
-      - ".github/workflows/run_notebook.yml"
-      - "requirements.txt"
-      - "dataset/dataset.zip"
-      - "data/train.csv"
-      - "data/test.csv"
-      - "data/train_ims/**"
-      - "data/test_ims/**"
-  pull_request:
-    branches: ["**"]
-    paths:
-      - "image_classifier.ipynb"
-      - ".github/workflows/run_notebook.yml"
-      - "requirements.txt"
-      - "dataset/dataset.zip"
-      - "data/train.csv"
-      - "data/test.csv"
-      - "data/train_ims/**"
-      - "data/test_ims/**"
-  workflow_dispatch:
+  pull_request_review:
+    types: [submitted]
+  issue_comment:
+    types: [created]
 
 concurrency:
-  group: notebook-ci-${{ github.ref }}
+  group: notebook-ci-pr-${{ github.event.pull_request.number || github.event.issue.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
   data-health:
+    if: >
+      github.event_name == 'pull_request_review' ||
+      (github.event_name == 'issue_comment' &&
+       github.event.issue.pull_request &&
+       startsWith(github.event.comment.body, '/rerun'))
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
       contents: read
+      pull-requests: read
 
     steps:
+      - name: Resolve PR context for /rerun
+        if: github.event_name == 'issue_comment'
+        id: prctx
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = context.payload.issue.number;
+            const { owner, repo } = context.repo;
+            const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
+            core.setOutput('head_sha', pr.head.sha);
+            core.setOutput('head_ref', pr.head.ref);
+            core.setOutput('head_repo', pr.head.repo.full_name);
+
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event_name == 'pull_request_review' && github.event.pull_request.head.repo.full_name || steps.prctx.outputs.head_repo }}
+          ref: ${{ github.event_name == 'pull_request_review' && github.event.pull_request.head.sha || steps.prctx.outputs.head_sha }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -210,15 +213,37 @@ jobs:
           retention-days: 14
 
   run-notebook:
+    if: >
+      github.event_name == 'pull_request_review' ||
+      (github.event_name == 'issue_comment' &&
+       github.event.issue.pull_request &&
+       startsWith(github.event.comment.body, '/rerun'))
     needs: data-health
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
       contents: read
+      pull-requests: read
 
     steps:
+      - name: Resolve PR context for /rerun
+        if: github.event_name == 'issue_comment'
+        id: prctx
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = context.payload.issue.number;
+            const { owner, repo } = context.repo;
+            const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
+            core.setOutput('head_sha', pr.head.sha);
+            core.setOutput('head_ref', pr.head.ref);
+            core.setOutput('head_repo', pr.head.repo.full_name);
+
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event_name == 'pull_request_review' && github.event.pull_request.head.repo.full_name || steps.prctx.outputs.head_repo }}
+          ref: ${{ github.event_name == 'pull_request_review' && github.event.pull_request.head.sha || steps.prctx.outputs.head_sha }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
