@@ -1,0 +1,101 @@
+name: Run Notebook
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+jobs:
+  run-notebook:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Generate synthetic dataset for CI
+        run: |
+          python - <<'EOF'
+          """Create a tiny synthetic dataset so the notebook can run in CI
+          without requiring real competition data."""
+          import os, random
+          from pathlib import Path
+          from PIL import Image
+          import numpy as np
+
+          CLASSES   = ['cat', 'dog', 'bird']
+          TRAIN_N   = 30   # images per class
+          TEST_N    = 20   # total test images
+          IMG_SIZE  = (64, 64)
+
+          random.seed(42)
+          np.random.seed(42)
+
+          # Training images
+          for cls in CLASSES:
+              d = Path('data') / 'train' / cls
+              d.mkdir(parents=True, exist_ok=True)
+              for i in range(TRAIN_N):
+                  # Each class gets a distinct dominant colour so models can learn
+                  base_color = {'cat': [200, 100, 80],
+                                'dog': [80, 160, 200],
+                                'bird': [100, 200, 80]}[cls]
+                  pixels = np.clip(
+                      np.random.randint(0, 60, (*IMG_SIZE, 3)) +
+                      np.array(base_color, dtype=np.uint8),
+                      0, 255
+                  ).astype(np.uint8)
+                  Image.fromarray(pixels).save(d / f'{cls}_{i:04d}.jpg')
+
+          # Test images (flat directory)
+          test_dir = Path('data') / 'test'
+          test_dir.mkdir(parents=True, exist_ok=True)
+          fnames = []
+          for i in range(TEST_N):
+              fname = f'test_{i:04d}.jpg'
+              pixels = np.random.randint(0, 255, (*IMG_SIZE, 3), dtype=np.uint8)
+              Image.fromarray(pixels).save(test_dir / fname)
+              fnames.append(fname)
+
+          # Sample submission
+          import csv
+          with open(Path('data') / 'sample_submission.csv', 'w', newline='') as f:
+              w = csv.writer(f)
+              w.writerow(['filename', 'label'])
+              for fn in fnames:
+                  w.writerow([fn, ''])
+
+          print(f'Synthetic dataset created: {TRAIN_N*len(CLASSES)} train, {TEST_N} test.')
+          EOF
+
+      - name: Execute notebook (CI mode)
+        env:
+          CI_MODE: "true"
+        run: |
+          jupyter nbconvert \
+            --to notebook \
+            --execute \
+            --ExecutePreprocessor.timeout=600 \
+            --output image_classifier_executed.ipynb \
+            image_classifier.ipynb
+
+      - name: Upload executed notebook
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: executed-notebook
+          path: image_classifier_executed.ipynb
+          retention-days: 14
