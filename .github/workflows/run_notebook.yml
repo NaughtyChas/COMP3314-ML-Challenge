@@ -7,6 +7,7 @@ on:
       - "image_classifier.ipynb"
       - ".github/workflows/run_notebook.yml"
       - "requirements.txt"
+      - "dataset/dataset.zip"
       - "data/train.csv"
       - "data/test.csv"
       - "data/train_ims/**"
@@ -17,6 +18,7 @@ on:
       - "image_classifier.ipynb"
       - ".github/workflows/run_notebook.yml"
       - "requirements.txt"
+      - "dataset/dataset.zip"
       - "data/train.csv"
       - "data/test.csv"
       - "data/train_ims/**"
@@ -30,7 +32,7 @@ concurrency:
 jobs:
   data-health:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     permissions:
       contents: read
 
@@ -44,6 +46,40 @@ jobs:
           python-version: "3.10"
           cache: "pip"
 
+      - name: Ensure dataset archive exists
+        run: |
+          if [ ! -f dataset/dataset.zip ]; then
+            echo "Missing dataset/dataset.zip"
+            exit 1
+          fi
+
+      - name: Restore cached extracted dataset
+        id: dataset-cache
+        uses: actions/cache@v4
+        with:
+          path: dataset/extracted
+          key: dataset-extracted-${{ runner.os }}-${{ hashFiles('dataset/dataset.zip') }}
+
+      - name: Extract dataset archive (cache miss)
+        if: steps.dataset-cache.outputs.cache-hit != 'true'
+        run: |
+          rm -rf dataset/extracted
+          mkdir -p dataset/extracted
+          unzip -q dataset/dataset.zip -d dataset/extracted
+
+      - name: Resolve dataset root
+        run: |
+          if [ -f dataset/extracted/data/train.csv ] && [ -f dataset/extracted/data/test.csv ]; then
+            echo "DATA_ROOT=dataset/extracted/data" >> "$GITHUB_ENV"
+          elif [ -f dataset/extracted/train.csv ] && [ -f dataset/extracted/test.csv ]; then
+            echo "DATA_ROOT=dataset/extracted" >> "$GITHUB_ENV"
+          elif [ -f data/train.csv ] && [ -f data/test.csv ]; then
+            echo "DATA_ROOT=data" >> "$GITHUB_ENV"
+          else
+            echo "Could not find train.csv/test.csv in extracted dataset."
+            exit 1
+          fi
+
       - name: Install minimal dependencies for data checks
         run: pip install pandas pillow
 
@@ -51,15 +87,17 @@ jobs:
         run: |
           python - <<'EOF'
           import json
+          import os
           import random
           import sys
           from pathlib import Path
+
           import pandas as pd
           from PIL import Image
 
           random.seed(42)
 
-          data_dir = Path('data')
+          data_dir = Path(os.environ.get('DATA_ROOT', 'data'))
           train_csv = data_dir / 'train.csv'
           test_csv = data_dir / 'test.csv'
           train_img_dir = data_dir / 'train_ims'
@@ -105,6 +143,7 @@ jobs:
           test_decode_fail = sample_decode_failures(test_df, test_img_dir)
 
           report = {
+              'data_root': str(data_dir),
               'train_rows': int(len(train_df)),
               'test_rows': int(len(test_df)),
               'train_missing_images': int(train_missing),
@@ -120,6 +159,7 @@ jobs:
           lines = []
           lines.append('# Data Health Report')
           lines.append('')
+          lines.append(f'- Data root: **{report["data_root"]}**')
           lines.append(f'- Train rows: **{report["train_rows"]}**')
           lines.append(f'- Test rows: **{report["test_rows"]}**')
           lines.append(f'- Missing train images: **{report["train_missing_images"]}**')
@@ -172,7 +212,7 @@ jobs:
   run-notebook:
     needs: data-health
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     permissions:
       contents: read
 
@@ -186,6 +226,48 @@ jobs:
           python-version: "3.10"
           cache: "pip"
 
+      - name: Ensure dataset archive exists
+        run: |
+          if [ ! -f dataset/dataset.zip ]; then
+            echo "Missing dataset/dataset.zip"
+            exit 1
+          fi
+
+      - name: Restore cached extracted dataset
+        id: dataset-cache
+        uses: actions/cache@v4
+        with:
+          path: dataset/extracted
+          key: dataset-extracted-${{ runner.os }}-${{ hashFiles('dataset/dataset.zip') }}
+
+      - name: Extract dataset archive (cache miss)
+        if: steps.dataset-cache.outputs.cache-hit != 'true'
+        run: |
+          rm -rf dataset/extracted
+          mkdir -p dataset/extracted
+          unzip -q dataset/dataset.zip -d dataset/extracted
+
+      - name: Resolve dataset root
+        run: |
+          if [ -f dataset/extracted/data/train.csv ] && [ -f dataset/extracted/data/test.csv ]; then
+            echo "DATA_ROOT=dataset/extracted/data" >> "$GITHUB_ENV"
+          elif [ -f dataset/extracted/train.csv ] && [ -f dataset/extracted/test.csv ]; then
+            echo "DATA_ROOT=dataset/extracted" >> "$GITHUB_ENV"
+          elif [ -f data/train.csv ] && [ -f data/test.csv ]; then
+            echo "DATA_ROOT=data" >> "$GITHUB_ENV"
+          else
+            echo "Could not find train.csv/test.csv in extracted dataset."
+            exit 1
+          fi
+
+      - name: Materialize data path for notebook
+        run: |
+          if [ "$DATA_ROOT" != "data" ]; then
+            rm -rf data
+            ln -s "$DATA_ROOT" data
+          fi
+          echo "Using DATA_ROOT=$DATA_ROOT"
+
       - name: Install dependencies
         run: pip install -r requirements.txt
 
@@ -197,7 +279,7 @@ jobs:
           jupyter nbconvert \
             --to notebook \
             --execute \
-            --ExecutePreprocessor.timeout=600 \
+            --ExecutePreprocessor.timeout=900 \
             --output image_classifier_executed.ipynb \
             image_classifier.ipynb
 
@@ -208,11 +290,12 @@ jobs:
           GITHUB_REF_NAME: ${{ github.ref_name }}
           GITHUB_RUN_ID: ${{ github.run_id }}
           GITHUB_RUN_NUMBER: ${{ github.run_number }}
+          DATA_ROOT: ${{ env.DATA_ROOT }}
         run: |
           python - <<'EOF'
           import json
-          import re
           import os
+          import re
           from datetime import datetime, timezone
           from pathlib import Path
 
@@ -221,31 +304,31 @@ jobs:
 
           nb_path = Path('image_classifier_executed.ipynb')
           metric_report_path = report_dir / 'notebook_metrics_report.md'
-            metric_json_path = report_dir / 'notebook_metrics.json'
-            user_metric_path = report_dir / 'metrics.json'
-            run_manifest_path = report_dir / 'run_manifest.json'
+          metric_json_path = report_dir / 'notebook_metrics.json'
+          user_metric_path = report_dir / 'metrics.json'
+          run_manifest_path = report_dir / 'run_manifest.json'
 
           lines = ['# Notebook Execution Report', '']
-            metric_source = 'none'
-            extracted_metrics = {}
+          metric_source = 'none'
+          extracted_metrics = {}
 
-            if user_metric_path.exists():
+          if user_metric_path.exists():
               try:
-                user_metrics = json.loads(user_metric_path.read_text(encoding='utf-8'))
-                if isinstance(user_metrics, dict):
-                  extracted_metrics = {
-                    str(k): v for k, v in user_metrics.items()
-                    if isinstance(v, (int, float, str, bool))
-                  }
-                  metric_source = 'reports/metrics.json'
+                  user_metrics = json.loads(user_metric_path.read_text(encoding='utf-8'))
+                  if isinstance(user_metrics, dict):
+                      extracted_metrics = {
+                          str(k): v for k, v in user_metrics.items()
+                          if isinstance(v, (int, float, str, bool))
+                      }
+                      metric_source = 'reports/metrics.json'
               except Exception:
-                pass
+                  pass
 
           if not nb_path.exists():
               lines.append('- Executed notebook was not generated (execution likely failed before output).')
               metric_json_path.write_text(
-                json.dumps({'source': metric_source, 'metrics': extracted_metrics}, indent=2, ensure_ascii=False) + '\n',
-                encoding='utf-8'
+                  json.dumps({'source': metric_source, 'metrics': extracted_metrics}, indent=2, ensure_ascii=False) + '\n',
+                  encoding='utf-8'
               )
               metric_report_path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
               raise SystemExit(0)
@@ -254,23 +337,25 @@ jobs:
           cells = nb.get('cells', [])
           code_cells = [c for c in cells if c.get('cell_type') == 'code']
           lines.append(f'- Code cells in notebook: **{len(code_cells)}**')
+          lines.append(f'- Data root used in CI: **{os.getenv("DATA_ROOT", "data")}**')
 
           text_chunks = []
           for cell in code_cells:
               for output in cell.get('outputs', []):
-                  if output.get('output_type') == 'stream':
+                  output_type = output.get('output_type')
+                  if output_type == 'stream':
                       txt = output.get('text', '')
                       if isinstance(txt, list):
                           txt = ''.join(txt)
                       text_chunks.append(txt)
-                  elif output.get('output_type') in {'execute_result', 'display_data'}:
+                  elif output_type in {'execute_result', 'display_data'}:
                       data = output.get('data', {})
                       txt = data.get('text/plain')
                       if txt:
                           if isinstance(txt, list):
                               txt = ''.join(txt)
                           text_chunks.append(txt)
-                  elif output.get('output_type') == 'error':
+                  elif output_type == 'error':
                       ename = output.get('ename', 'Error')
                       evalue = output.get('evalue', '')
                       text_chunks.append(f'{ename}: {evalue}')
@@ -282,55 +367,58 @@ jobs:
           )
           metric_matches = metric_pattern.findall(text_blob)
 
-            if not extracted_metrics:
+          if not extracted_metrics:
               metric_source = 'parsed_notebook_output'
               normalized = []
               for name, value in metric_matches:
-                normalized_name = name.lower().replace(' ', '_').replace('-', '_')
-                normalized.append((normalized_name, value))
+                  normalized_name = name.lower().replace(' ', '_').replace('-', '_')
+                  normalized.append((normalized_name, value))
 
               deduped = []
               seen = set()
               for item in normalized:
-                if item in seen:
-                  continue
-                seen.add(item)
-                deduped.append(item)
+                  if item in seen:
+                      continue
+                  seen.add(item)
+                  deduped.append(item)
 
               for metric_name, metric_value in deduped[:50]:
-                try:
-                  extracted_metrics[metric_name] = float(metric_value)
-                except Exception:
-                  extracted_metrics[metric_name] = metric_value
+                  try:
+                      extracted_metrics[metric_name] = float(metric_value)
+                  except Exception:
+                      extracted_metrics[metric_name] = metric_value
 
-            metric_payload = {
+          metric_payload = {
               'source': metric_source,
               'metrics': extracted_metrics
-            }
-            metric_json_path.write_text(
+          }
+          metric_json_path.write_text(
               json.dumps(metric_payload, indent=2, ensure_ascii=False) + '\n',
               encoding='utf-8'
-            )
+          )
 
-            run_manifest = {
+          run_manifest = {
               'generated_at_utc': datetime.now(timezone.utc).isoformat(),
               'git_sha': os.getenv('GITHUB_SHA', ''),
               'git_ref_name': os.getenv('GITHUB_REF_NAME', ''),
               'run_id': os.getenv('GITHUB_RUN_ID', ''),
               'run_number': os.getenv('GITHUB_RUN_NUMBER', ''),
+              'data_root': os.getenv('DATA_ROOT', 'data'),
+              'dataset_zip': 'dataset/dataset.zip',
               'notebook_path': 'image_classifier.ipynb',
               'executed_notebook_path': str(nb_path),
               'metrics_path': str(metric_json_path)
-            }
-            run_manifest_path.write_text(
+          }
+          run_manifest_path.write_text(
               json.dumps(run_manifest, indent=2, ensure_ascii=False) + '\n',
               encoding='utf-8'
-            )
+          )
 
           lines.append('')
-            lines.append(f'- Metric source: **{metric_source}**')
-            lines.append('')
-            if extracted_metrics:
+          lines.append(f'- Metric source: **{metric_source}**')
+          lines.append('')
+
+          if extracted_metrics:
               lines.append('## Metrics found in notebook outputs')
               lines.append('')
               lines.append('| Metric | Value |')
@@ -342,13 +430,13 @@ jobs:
               lines.append('')
               lines.append('- No recognizable metric strings found in notebook outputs.')
 
-            lines.append('')
-            lines.append('## Artifact files')
-            lines.append('')
-            lines.append('- `reports/notebook_metrics.json`')
-            lines.append('- `reports/notebook_metrics_report.md`')
-            lines.append('- `reports/run_manifest.json`')
-            lines.append('- `image_classifier_executed.ipynb`')
+          lines.append('')
+          lines.append('## Artifact files')
+          lines.append('')
+          lines.append('- reports/notebook_metrics.json')
+          lines.append('- reports/notebook_metrics_report.md')
+          lines.append('- reports/run_manifest.json')
+          lines.append('- image_classifier_executed.ipynb')
 
           metric_report_path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
           print(f'Notebook report generated at {metric_report_path}')
@@ -384,6 +472,5 @@ jobs:
         if: always()
         with:
           name: notebook-run-${{ github.run_number }}-${{ github.sha }}
-          path: |
-            ci_artifacts
+          path: ci_artifacts
           retention-days: 14
