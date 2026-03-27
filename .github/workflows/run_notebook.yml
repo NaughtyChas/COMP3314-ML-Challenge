@@ -3,13 +3,176 @@ name: Run Notebook
 on:
   push:
     branches: ["**"]
+    paths:
+      - "image_classifier.ipynb"
+      - ".github/workflows/run_notebook.yml"
+      - "requirements.txt"
+      - "data/train.csv"
+      - "data/test.csv"
+      - "data/train_ims/**"
+      - "data/test_ims/**"
   pull_request:
     branches: ["**"]
+    paths:
+      - "image_classifier.ipynb"
+      - ".github/workflows/run_notebook.yml"
+      - "requirements.txt"
+      - "data/train.csv"
+      - "data/test.csv"
+      - "data/train_ims/**"
+      - "data/test_ims/**"
+  workflow_dispatch:
+
+concurrency:
+  group: notebook-ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  run-notebook:
+  data-health:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 15
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: "pip"
+
+      - name: Install minimal dependencies for data checks
+        run: pip install pandas pillow
+
+      - name: Validate repository datasets and generate data report
+        run: |
+          python - <<'EOF'
+          import json
+          import random
+          import sys
+          from pathlib import Path
+          import pandas as pd
+          from PIL import Image
+
+          random.seed(42)
+
+          data_dir = Path('data')
+          train_csv = data_dir / 'train.csv'
+          test_csv = data_dir / 'test.csv'
+          train_img_dir = data_dir / 'train_ims'
+          test_img_dir = data_dir / 'test_ims'
+          report_dir = Path('reports')
+          report_dir.mkdir(parents=True, exist_ok=True)
+
+          for path in [train_csv, test_csv, train_img_dir, test_img_dir]:
+              if not path.exists():
+                  raise FileNotFoundError(f'Missing required path: {path}')
+
+          train_df = pd.read_csv(train_csv)
+          test_df = pd.read_csv(test_csv)
+
+          required_cols = {'im_name', 'label'}
+          if not required_cols.issubset(train_df.columns):
+              raise ValueError(f'train.csv must include columns: {required_cols}')
+          if not required_cols.issubset(test_df.columns):
+              raise ValueError(f'test.csv must include columns: {required_cols}')
+
+          train_missing = (~train_df['im_name'].apply(lambda x: (train_img_dir / str(x)).exists())).sum()
+          test_missing = (~test_df['im_name'].apply(lambda x: (test_img_dir / str(x)).exists())).sum()
+
+          train_dist = train_df['label'].value_counts().sort_index().to_dict()
+
+          def sample_decode_failures(df, img_dir, sample_size=300):
+              names = [str(x) for x in df['im_name'].tolist()]
+              if len(names) > sample_size:
+                  names = random.sample(names, sample_size)
+              failures = []
+              for name in names:
+                  p = img_dir / name
+                  if not p.exists():
+                      continue
+                  try:
+                      with Image.open(p) as img:
+                          img.verify()
+                  except Exception:
+                      failures.append(name)
+              return failures
+
+          train_decode_fail = sample_decode_failures(train_df, train_img_dir)
+          test_decode_fail = sample_decode_failures(test_df, test_img_dir)
+
+          report = {
+              'train_rows': int(len(train_df)),
+              'test_rows': int(len(test_df)),
+              'train_missing_images': int(train_missing),
+              'test_missing_images': int(test_missing),
+              'sampled_train_decode_failures': train_decode_fail,
+              'sampled_test_decode_failures': test_decode_fail,
+              'train_label_distribution': {str(k): int(v) for k, v in train_dist.items()}
+          }
+
+          with open(report_dir / 'data_health_report.json', 'w', encoding='utf-8') as f:
+              json.dump(report, f, indent=2, ensure_ascii=False)
+
+          lines = []
+          lines.append('# Data Health Report')
+          lines.append('')
+          lines.append(f'- Train rows: **{report["train_rows"]}**')
+          lines.append(f'- Test rows: **{report["test_rows"]}**')
+          lines.append(f'- Missing train images: **{report["train_missing_images"]}**')
+          lines.append(f'- Missing test images: **{report["test_missing_images"]}**')
+          lines.append(f'- Sampled train decode failures: **{len(train_decode_fail)}**')
+          lines.append(f'- Sampled test decode failures: **{len(test_decode_fail)}**')
+          lines.append('')
+          lines.append('## Train label distribution')
+          lines.append('')
+          lines.append('| Label | Count |')
+          lines.append('|---|---:|')
+          for label, count in report['train_label_distribution'].items():
+              lines.append(f'| {label} | {count} |')
+
+          with open(report_dir / 'data_health_report.md', 'w', encoding='utf-8') as f:
+              f.write('\n'.join(lines) + '\n')
+
+          has_hard_failure = (
+              report['train_missing_images'] > 0 or
+              report['test_missing_images'] > 0 or
+              len(train_decode_fail) > 0 or
+              len(test_decode_fail) > 0
+          )
+
+          print('Data health report generated at reports/data_health_report.md')
+          if has_hard_failure:
+              print('Dataset health check failed.')
+              sys.exit(1)
+          EOF
+
+      - name: Publish data report to job summary
+        if: always()
+        run: |
+          if [ -f reports/data_health_report.md ]; then
+            cat reports/data_health_report.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "# Data Health Report" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Report file was not generated due to an earlier failure." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload data health artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: data-health-report
+          path: reports/data_health_report.*
+          retention-days: 14
+
+  run-notebook:
+    needs: data-health
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
     permissions:
       contents: read
 
@@ -26,64 +189,10 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Generate synthetic dataset for CI
-        run: |
-          python - <<'EOF'
-          """Create a tiny synthetic dataset so the notebook can run in CI
-          without requiring real competition data."""
-          import os, random
-          from pathlib import Path
-          from PIL import Image
-          import numpy as np
-
-          CLASSES   = ['cat', 'dog', 'bird']
-          TRAIN_N   = 30   # images per class
-          TEST_N    = 20   # total test images
-          IMG_SIZE  = (64, 64)
-
-          random.seed(42)
-          np.random.seed(42)
-
-          # Training images
-          for cls in CLASSES:
-              d = Path('data') / 'train' / cls
-              d.mkdir(parents=True, exist_ok=True)
-              for i in range(TRAIN_N):
-                  # Each class gets a distinct dominant colour so models can learn
-                  base_color = {'cat': [200, 100, 80],
-                                'dog': [80, 160, 200],
-                                'bird': [100, 200, 80]}[cls]
-                  pixels = np.clip(
-                      np.random.randint(0, 60, (*IMG_SIZE, 3)) +
-                      np.array(base_color, dtype=np.uint8),
-                      0, 255
-                  ).astype(np.uint8)
-                  Image.fromarray(pixels).save(d / f'{cls}_{i:04d}.jpg')
-
-          # Test images (flat directory)
-          test_dir = Path('data') / 'test'
-          test_dir.mkdir(parents=True, exist_ok=True)
-          fnames = []
-          for i in range(TEST_N):
-              fname = f'test_{i:04d}.jpg'
-              pixels = np.random.randint(0, 255, (*IMG_SIZE, 3), dtype=np.uint8)
-              Image.fromarray(pixels).save(test_dir / fname)
-              fnames.append(fname)
-
-          # Sample submission
-          import csv
-          with open(Path('data') / 'sample_submission.csv', 'w', newline='') as f:
-              w = csv.writer(f)
-              w.writerow(['filename', 'label'])
-              for fn in fnames:
-                  w.writerow([fn, ''])
-
-          print(f'Synthetic dataset created: {TRAIN_N*len(CLASSES)} train, {TEST_N} test.')
-          EOF
-
       - name: Execute notebook (CI mode)
         env:
           CI_MODE: "true"
+          CI_SAMPLE_SIZE: "5000"
         run: |
           jupyter nbconvert \
             --to notebook \
@@ -92,10 +201,189 @@ jobs:
             --output image_classifier_executed.ipynb \
             image_classifier.ipynb
 
-      - name: Upload executed notebook
+      - name: Extract notebook metrics and generate report
+        if: always()
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          python - <<'EOF'
+          import json
+          import re
+          import os
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          report_dir = Path('reports')
+          report_dir.mkdir(parents=True, exist_ok=True)
+
+          nb_path = Path('image_classifier_executed.ipynb')
+          metric_report_path = report_dir / 'notebook_metrics_report.md'
+            metric_json_path = report_dir / 'notebook_metrics.json'
+            user_metric_path = report_dir / 'metrics.json'
+            run_manifest_path = report_dir / 'run_manifest.json'
+
+          lines = ['# Notebook Execution Report', '']
+            metric_source = 'none'
+            extracted_metrics = {}
+
+            if user_metric_path.exists():
+              try:
+                user_metrics = json.loads(user_metric_path.read_text(encoding='utf-8'))
+                if isinstance(user_metrics, dict):
+                  extracted_metrics = {
+                    str(k): v for k, v in user_metrics.items()
+                    if isinstance(v, (int, float, str, bool))
+                  }
+                  metric_source = 'reports/metrics.json'
+              except Exception:
+                pass
+
+          if not nb_path.exists():
+              lines.append('- Executed notebook was not generated (execution likely failed before output).')
+              metric_json_path.write_text(
+                json.dumps({'source': metric_source, 'metrics': extracted_metrics}, indent=2, ensure_ascii=False) + '\n',
+                encoding='utf-8'
+              )
+              metric_report_path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+              raise SystemExit(0)
+
+          nb = json.loads(nb_path.read_text(encoding='utf-8'))
+          cells = nb.get('cells', [])
+          code_cells = [c for c in cells if c.get('cell_type') == 'code']
+          lines.append(f'- Code cells in notebook: **{len(code_cells)}**')
+
+          text_chunks = []
+          for cell in code_cells:
+              for output in cell.get('outputs', []):
+                  if output.get('output_type') == 'stream':
+                      txt = output.get('text', '')
+                      if isinstance(txt, list):
+                          txt = ''.join(txt)
+                      text_chunks.append(txt)
+                  elif output.get('output_type') in {'execute_result', 'display_data'}:
+                      data = output.get('data', {})
+                      txt = data.get('text/plain')
+                      if txt:
+                          if isinstance(txt, list):
+                              txt = ''.join(txt)
+                          text_chunks.append(txt)
+                  elif output.get('output_type') == 'error':
+                      ename = output.get('ename', 'Error')
+                      evalue = output.get('evalue', '')
+                      text_chunks.append(f'{ename}: {evalue}')
+
+          text_blob = '\n'.join(text_chunks)
+
+          metric_pattern = re.compile(
+              r'(?i)\b(accuracy|acc|f1(?:[_\- ]?score)?|precision|recall|auc|roc[_\- ]?auc|loss|mae|rmse)\b[^\d\-]{0,20}(-?\d+(?:\.\d+)?)'
+          )
+          metric_matches = metric_pattern.findall(text_blob)
+
+            if not extracted_metrics:
+              metric_source = 'parsed_notebook_output'
+              normalized = []
+              for name, value in metric_matches:
+                normalized_name = name.lower().replace(' ', '_').replace('-', '_')
+                normalized.append((normalized_name, value))
+
+              deduped = []
+              seen = set()
+              for item in normalized:
+                if item in seen:
+                  continue
+                seen.add(item)
+                deduped.append(item)
+
+              for metric_name, metric_value in deduped[:50]:
+                try:
+                  extracted_metrics[metric_name] = float(metric_value)
+                except Exception:
+                  extracted_metrics[metric_name] = metric_value
+
+            metric_payload = {
+              'source': metric_source,
+              'metrics': extracted_metrics
+            }
+            metric_json_path.write_text(
+              json.dumps(metric_payload, indent=2, ensure_ascii=False) + '\n',
+              encoding='utf-8'
+            )
+
+            run_manifest = {
+              'generated_at_utc': datetime.now(timezone.utc).isoformat(),
+              'git_sha': os.getenv('GITHUB_SHA', ''),
+              'git_ref_name': os.getenv('GITHUB_REF_NAME', ''),
+              'run_id': os.getenv('GITHUB_RUN_ID', ''),
+              'run_number': os.getenv('GITHUB_RUN_NUMBER', ''),
+              'notebook_path': 'image_classifier.ipynb',
+              'executed_notebook_path': str(nb_path),
+              'metrics_path': str(metric_json_path)
+            }
+            run_manifest_path.write_text(
+              json.dumps(run_manifest, indent=2, ensure_ascii=False) + '\n',
+              encoding='utf-8'
+            )
+
+          lines.append('')
+            lines.append(f'- Metric source: **{metric_source}**')
+            lines.append('')
+            if extracted_metrics:
+              lines.append('## Metrics found in notebook outputs')
+              lines.append('')
+              lines.append('| Metric | Value |')
+              lines.append('|---|---:|')
+              for metric_name, metric_value in sorted(extracted_metrics.items()):
+                  lines.append(f'| {metric_name} | {metric_value} |')
+          else:
+              lines.append('## Metrics found in notebook outputs')
+              lines.append('')
+              lines.append('- No recognizable metric strings found in notebook outputs.')
+
+            lines.append('')
+            lines.append('## Artifact files')
+            lines.append('')
+            lines.append('- `reports/notebook_metrics.json`')
+            lines.append('- `reports/notebook_metrics_report.md`')
+            lines.append('- `reports/run_manifest.json`')
+            lines.append('- `image_classifier_executed.ipynb`')
+
+          metric_report_path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+          print(f'Notebook report generated at {metric_report_path}')
+          EOF
+
+      - name: Publish notebook report to job summary
+        if: always()
+        run: |
+          if [ -f reports/notebook_metrics_report.md ]; then
+            cat reports/notebook_metrics_report.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "# Notebook Execution Report" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Metrics report file was not generated due to an earlier failure." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Collect optional model outputs
+        if: always()
+        run: |
+          mkdir -p ci_artifacts
+          cp -f image_classifier_executed.ipynb ci_artifacts/ 2>/dev/null || true
+          cp -f reports/notebook_metrics_report.md ci_artifacts/ 2>/dev/null || true
+          cp -f reports/notebook_metrics.json ci_artifacts/ 2>/dev/null || true
+          cp -f reports/run_manifest.json ci_artifacts/ 2>/dev/null || true
+          cp -f reports/metrics.json ci_artifacts/user_metrics.json 2>/dev/null || true
+          cp -f submission.csv ci_artifacts/ 2>/dev/null || true
+          cp -f reports/submission.csv ci_artifacts/submission_from_reports.csv 2>/dev/null || true
+          cp -f reports/data_health_report.md ci_artifacts/ 2>/dev/null || true
+          cp -f reports/data_health_report.json ci_artifacts/ 2>/dev/null || true
+
+      - name: Upload notebook run artifact bundle
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: executed-notebook
-          path: image_classifier_executed.ipynb
+          name: notebook-run-${{ github.run_number }}-${{ github.sha }}
+          path: |
+            ci_artifacts
           retention-days: 14
