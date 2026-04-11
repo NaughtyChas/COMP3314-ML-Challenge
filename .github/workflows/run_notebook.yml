@@ -305,8 +305,8 @@ jobs:
             --to notebook \
             --execute \
             --ExecutePreprocessor.timeout=900 \
-            --output image_classifier_executed.ipynb \
-            image_classifier.ipynb
+            --output MLClassifier_executed.ipynb \
+            MLClassifier.ipynb
 
       - name: Extract notebook metrics and generate report
         if: always()
@@ -327,7 +327,7 @@ jobs:
           report_dir = Path('reports')
           report_dir.mkdir(parents=True, exist_ok=True)
 
-          nb_path = Path('image_classifier_executed.ipynb')
+          nb_path = Path('MLClassifier_executed.ipynb')
           metric_report_path = report_dir / 'notebook_metrics_report.md'
           metric_json_path = report_dir / 'notebook_metrics.json'
           user_metric_path = report_dir / 'metrics.json'
@@ -430,7 +430,7 @@ jobs:
               'run_number': os.getenv('GITHUB_RUN_NUMBER', ''),
               'data_root': os.getenv('DATA_ROOT', 'data'),
               'dataset_zip': 'dataset/dataset.zip',
-              'notebook_path': 'image_classifier.ipynb',
+              'notebook_path': 'MLClassifier.ipynb',
               'executed_notebook_path': str(nb_path),
               'metrics_path': str(metric_json_path)
           }
@@ -461,7 +461,7 @@ jobs:
           lines.append('- reports/notebook_metrics.json')
           lines.append('- reports/notebook_metrics_report.md')
           lines.append('- reports/run_manifest.json')
-          lines.append('- image_classifier_executed.ipynb')
+          lines.append('- MLClassifier_executed.ipynb')
 
           metric_report_path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
           print(f'Notebook report generated at {metric_report_path}')
@@ -482,7 +482,7 @@ jobs:
         if: always()
         run: |
           mkdir -p ci_artifacts
-          cp -f image_classifier_executed.ipynb ci_artifacts/ 2>/dev/null || true
+          cp -f MLClassifier_executed.ipynb ci_artifacts/ 2>/dev/null || true
           cp -f reports/notebook_metrics_report.md ci_artifacts/ 2>/dev/null || true
           cp -f reports/notebook_metrics.json ci_artifacts/ 2>/dev/null || true
           cp -f reports/run_manifest.json ci_artifacts/ 2>/dev/null || true
